@@ -24,8 +24,9 @@ class ProjectionHeads(nn.Module):
 def init_logit_scale() -> nn.Parameter:
     return nn.Parameter(torch.tensor(math.log(1.0 / 0.07)))
 
-def clip_loss(image_embeds: torch.Tensor, text_embeds: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
-    logits = (image_embeds @ text_embeds.T) / temperature
+def clip_loss(image_embeds: torch.Tensor, text_embeds: torch.Tensor, logit_scale: torch.Tensor) -> torch.Tensor:
+    scale = torch.exp(logit_scale)
+    logits = (image_embeds @ text_embeds.T) * scale
     B = image_embeds.size(0)
     labels = torch.arange(B, device=image_embeds.device)
     loss_i2t = F.cross_entropy(logits, labels)

@@ -5,9 +5,10 @@ You implement: PatchEmbeddings, ViT.
 
 from __future__ import annotations
 
+import math
 import torch
 import torch.nn as nn
-from basics.model import Block 
+from basics.model import Block
 
 
 class PatchEmbeddings(nn.Module):
@@ -32,33 +33,21 @@ class PatchEmbeddings(nn.Module):
         self.img_size = img_size
         self.patch_size = patch_size
         self.d_model = d_model
-        
-        # Number of patches: (H / P) * (W / P)
+
         self.num_patches = (img_size // patch_size) ** 2
-        
-        # Use a Conv2d layer to extract patches and project them to d_model simultaneously
-        # in_channels is 3 assuming standard RGB images
+
         self.proj = nn.Conv2d(
-            in_channels=3, 
-            out_channels=d_model, 
-            kernel_size=patch_size, 
+            in_channels=3,
+            out_channels=d_model,
+            kernel_size=patch_size,
             stride=patch_size
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Input x shape: (Batch_Size, Channels, Height, Width) -> (B, 3, H, W)
-        
-        # Apply convolution
-        x = self.proj(x)  # Shape becomes: (B, d_model, H/patch_size, W/patch_size)
-        
-        # Flatten the spatial dimensions (Height and Width) into a single sequence dimension
-        x = x.flatten(2)  # Shape becomes: (B, d_model, num_patches)
-        
-        # Transpose to match transformer expectations: (Batch_Size, Sequence_Length, d_model)
-        x = x.transpose(1, 2)  # Shape becomes: (B, num_patches, d_model)
-        
+        x = self.proj(x)   # (B, d_model, H/P, W/P)
+        x = x.flatten(2)   # (B, d_model, num_patches)
+        x = x.transpose(1, 2)  # (B, num_patches, d_model)
         return x
-
 
 
 class ViT(nn.Module):
@@ -67,17 +56,15 @@ class ViT(nn.Module):
     Pipeline:
       1. Patchify with `PatchEmbeddings`.
       2. Prepend a learnable [CLS] token.
-      3. Add a learnable positional embedding of shape (1, num_patches+1, d_model).
-      4. Pass the sequence through `num_blocks` Transformer Blocks
-         (with is_decoder=False).
+      3. Add positional encoding (learned, rope1d, or rope2d).
+      4. Pass through `num_blocks` Transformer Blocks (is_decoder=False).
       5. Apply a final LayerNorm.
-      6. Return only the [CLS] slice — shape (B, d_model).
-
-    For §5 (VLM), you may want a `return_all_tokens=True` flag that returns the
-    full (B, num_patches+1, d_model) sequence instead. Add it when you get there.
+      6. Return the [CLS] embedding (B, d_model) by default.
+         If return_all_tokens=True, return (B, N+1, d_model).
 
     Args:
         img_size, patch_size, d_model, num_heads, num_blocks, dropout
+        pos_encoding: "learned" | "rope1d" | "rope2d"
     """
 
     def __init__(
@@ -87,62 +74,119 @@ class ViT(nn.Module):
         d_model: int = 768,
         num_heads: int = 12,
         num_blocks: int = 12,
-        num_classes: int = 1000,
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        pos_encoding: str = "learned",
     ):
         super().__init__()
+        self.d_model = d_model
+        self.pos_encoding = pos_encoding
 
-        # 1. Patch Embeddings
-        # Ensure PatchEmbeddings is also imported or defined above this in your vit.py
         self.patch_embed = PatchEmbeddings(img_size, patch_size, d_model)
-        num_patches = self.patch_embed.num_patches
+        self.num_patches = self.patch_embed.num_patches
+        self.patch_size = patch_size
+        self.grid_size = img_size // patch_size
 
-        # 2. CLS Token and Positional Embeddings
         self.cls_token = nn.Parameter(torch.randn(1, 1, d_model))
-        # Using zeros as hinted in your traceback
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, d_model))
+
+        if pos_encoding == "learned":
+            self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches + 1, d_model))
+        elif pos_encoding == "rope1d":
+            from basics.rope import RoPE1D
+            head_dim = d_model // num_heads
+            # Support up to 4× the training sequence length for extrapolation
+            self.rope = RoPE1D(head_dim, max_seq_len=self.num_patches * 4 + 1)
+            self.pos_embed = None
+        elif pos_encoding == "rope2d":
+            from basics.rope import RoPE2D
+            head_dim = d_model // num_heads
+            self.rope = RoPE2D(head_dim, grid_size=self.grid_size * 4)
+            self.pos_embed = None
+        else:
+            raise ValueError(f"Unknown pos_encoding: {pos_encoding}")
+
         self.pos_drop = nn.Dropout(p=dropout)
 
-        # 3. Transformer Encoder (using basics.model.Block)
         self.blocks = nn.ModuleList([
-            Block(d_model=d_model, num_heads=num_heads, block_size=num_patches + 1, is_decoder=False)
+            Block(d_model=d_model, num_heads=num_heads, block_size=self.num_patches + 1, is_decoder=False)
             for _ in range(num_blocks)
         ])
         self.norm = nn.LayerNorm(d_model)
 
-        # 4. Classification Head
-        self.head = nn.Linear(d_model, num_classes) if num_classes > 0 else nn.Identity()
+    def _apply_rope1d(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply 1D RoPE to x of shape (B, T, d_model) treating it as Q/K."""
+        B, T, D = x.shape
+        positions = torch.arange(T, device=x.device)
+        head_dim = self.rope.head_dim
+        num_heads = D // head_dim
+        # Reshape to (B, num_heads, T, head_dim)
+        x_h = x.view(B, T, num_heads, head_dim).transpose(1, 2)
+        x_rot = self.rope(x_h, positions)
+        return x_rot.transpose(1, 2).reshape(B, T, D)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _apply_rope2d(self, x: torch.Tensor, N: int) -> torch.Tensor:
+        """Apply 2D RoPE to x: CLS token is position (0,0), patches get grid coords."""
+        B, T, D = x.shape
+        head_dim = self.rope.head_dim
+        num_heads = D // head_dim
+
+        grid = int(math.isqrt(N))
+        x_coords = torch.arange(N, device=x.device) % grid
+        y_coords = torch.arange(N, device=x.device) // grid
+
+        # CLS token gets position (0, 0); patches get their grid coords
+        x_c = torch.zeros(1, device=x.device, dtype=torch.long)
+        y_c = torch.zeros(1, device=x.device, dtype=torch.long)
+
+        x_coords = torch.cat([x_c, x_coords])
+        y_coords = torch.cat([y_c, y_coords])
+
+        x_h = x.view(B, T, num_heads, head_dim).transpose(1, 2)
+        x_rot = self.rope(x_h, x_coords, y_coords)
+        return x_rot.transpose(1, 2).reshape(B, T, D)
+
+    def forward(self, x: torch.Tensor, return_all_tokens: bool = False) -> torch.Tensor:
         B = x.shape[0]
 
-        # 1. Create patch embeddings
-        x = self.patch_embed(x)  # (B, num_patches, d_model)
+        x = self.patch_embed(x)  # (B, N, d_model)
+        N = x.shape[1]  # actual number of patches (may differ from self.num_patches at extrapolation)
 
-        # 2. Prepend CLS token
-        cls_tokens = self.cls_token.expand(B, -1, -1)  # (B, 1, d_model)
-        x = torch.cat((cls_tokens, x), dim=1)  # (B, 1 + num_patches, d_model)
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)  # (B, N+1, d_model)
 
-        # 3. Add positional embeddings
-        x = x + self.pos_embed
-        x = self.pos_drop(x)
+        if self.pos_encoding == "learned":
+            # Optionally interpolate pos_embed if sequence length differs
+            if x.shape[1] != self.pos_embed.shape[1]:
+                pos_embed = self._interpolate_pos_embed(x.shape[1] - 1)
+            else:
+                pos_embed = self.pos_embed
+            x = x + pos_embed
+            x = self.pos_drop(x)
+        elif self.pos_encoding == "rope1d":
+            x = self._apply_rope1d(x)
+        elif self.pos_encoding == "rope2d":
+            x = self._apply_rope2d(x, N)
 
-        # 4. Pass through Transformer blocks
         for block in self.blocks:
             x = block(x)
 
-        # 5. Extract the CLS token's representation and apply the final LayerNorm
         x = self.norm(x)
-        
-        # If no classification head (CLIP pretraining), return the full sequence
-        if isinstance(self.head, nn.Identity):
-            return x
-            
-        cls_out = x[:, 0]  # Take the 0th token (CLS) across all batches: (B, d_model)
 
-        # 6. Pass through the classification head
-        out = self.head(cls_out)  # (B, num_classes)
+        if return_all_tokens:
+            return x  # (B, N+1, d_model)
+        return x[:, 0]  # (B, d_model)
 
-        return out
+    def _interpolate_pos_embed(self, new_num_patches: int) -> torch.Tensor:
+        """Bilinearly interpolate patch position embeddings to a new grid size."""
+        pos_embed = self.pos_embed  # (1, N+1, d_model)
+        cls_pe = pos_embed[:, :1, :]  # (1, 1, d_model)
+        patch_pe = pos_embed[:, 1:, :]  # (1, N, d_model)
 
+        old_grid = int(math.isqrt(patch_pe.shape[1]))
+        new_grid = int(math.isqrt(new_num_patches))
 
+        patch_pe = patch_pe.reshape(1, old_grid, old_grid, -1).permute(0, 3, 1, 2)
+        patch_pe = torch.nn.functional.interpolate(
+            patch_pe, size=(new_grid, new_grid), mode="bilinear", align_corners=False
+        )
+        patch_pe = patch_pe.permute(0, 2, 3, 1).reshape(1, new_grid * new_grid, -1)
+        return torch.cat([cls_pe, patch_pe], dim=1)

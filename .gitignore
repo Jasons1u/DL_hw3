@@ -1,0 +1,14 @@
+# Model checkpoints and training outputs
+runs/
+
+# Datasets
+data/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Jupyter
+.ipynb_checkpoints/

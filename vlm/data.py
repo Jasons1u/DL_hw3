@@ -219,6 +219,98 @@ class CLEVRMiniDataset(Dataset):
         }
 
 
+def build_clevr_dataloader(
+    split: str = "train",
+    img_size: int = 64,
+    batch_size: int = 32,
+    num_workers: int = 4,
+    tokenizer=None,
+    max_length: int = 64,
+    use_image_token: bool = False,
+) -> DataLoader:
+    """Return a DataLoader that yields tokenized batches for VLM training.
+
+    Each batch is a dict with keys:
+        images:         (B, 3, img_size, img_size)
+        input_ids:      (B, T) long tensor
+        attention_mask: (B, T) long tensor
+        labels:         (B, T) long tensor (-100 on prompt/padding tokens)
+        question:       list[str]
+        answer:         list[str]
+        q_type:         list[str]
+    """
+    dataset = CLEVRMiniDataset(split, img_size=img_size)
+
+    def _collate(batch):
+        images = torch.stack([b["image"] for b in batch])
+        questions = [b["question"] for b in batch]
+        answers = [b["answer"] for b in batch]
+        q_types = [b["q_type"] for b in batch]
+
+        if tokenizer is None:
+            return {
+                "images": images,
+                "question": questions,
+                "answer": answers,
+                "q_type": q_types,
+            }
+
+        if use_image_token:
+            prompts = [f"<image> Question: {q} Answer:" for q in questions]
+            full_texts = [f"<image> Question: {q} Answer: {a}" for q, a in zip(questions, answers)]
+        else:
+            prompts = [f"Question: {q} Answer:" for q in questions]
+            full_texts = [f"Question: {q} Answer: {a}" for q, a in zip(questions, answers)]
+
+        tokenizer.padding_side = "right"
+        enc_full = tokenizer(
+            full_texts,
+            padding="max_length",
+            truncation=True,
+            max_length=max_length,
+            return_tensors="pt",
+        )
+        enc_prompt = tokenizer(
+            prompts,
+            padding="max_length",
+            truncation=True,
+            max_length=max_length,
+            return_tensors="pt",
+        )
+
+        input_ids = enc_full["input_ids"]
+        attention_mask = enc_full["attention_mask"]
+
+        # mask out prompt + padding positions in labels
+        # prompt_len: number of real tokens in prompt (with BOS, no pad)
+        labels = input_ids.clone()
+        for i, prompt_ids in enumerate(enc_prompt["input_ids"]):
+            prompt_len = (prompt_ids != tokenizer.pad_token_id).sum().item()
+            labels[i, :prompt_len] = -100
+        labels[labels == tokenizer.pad_token_id] = -100
+
+        return {
+            "images": images,
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+            "question": questions,
+            "answer": answers,
+            "q_type": q_types,
+        }
+
+    shuffle = split == "train"
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        collate_fn=_collate,
+        pin_memory=True,
+        drop_last=(split == "train"),
+    )
+
+
 def build_clevr_loaders(
     img_size: int = 64,
     batch_size: int = 32,

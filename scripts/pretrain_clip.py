@@ -43,6 +43,9 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--config", type=Path, required=True)
     p.add_argument("--output-dir", type=Path, default=Path("runs/clip_eurosat"))
+    p.add_argument("--pos-encoding", default="learned",
+                   choices=["learned", "rope1d", "rope2d"],
+                   help="Positional encoding type for the ViT")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--wandb", action="store_true", help="Log to W&B")
     return p.parse_args()
@@ -65,9 +68,10 @@ def main() -> None:
     device = torch.device(args.device)
 
     print("Building train/val/test loaders...", flush=True)
+    train_cfg = cfg.get("train", {})
     train_loader, val_loader, test_loader = build_eurosat_loaders(
-        batch_size=cfg.get("batch_size", 128),
-        num_workers=cfg.get("num_workers", 2)
+        batch_size=train_cfg.get("batch_size", cfg.get("batch_size", 256)),
+        num_workers=train_cfg.get("num_workers", cfg.get("num_workers", 4))
     )
     print("Loaders built successfully!", flush=True)
 
@@ -79,8 +83,9 @@ def main() -> None:
         d_model=vit_cfg.get("d_model", 384),
         num_heads=vit_cfg.get("num_heads", 6),
         num_blocks=vit_cfg.get("num_blocks", 6),
-        num_classes=0,
+        pos_encoding=args.pos_encoding,
     ).to(device)
+    print(f"ViT positional encoding: {args.pos_encoding}")
 
     text_encoder = FrozenTextEncoder().to(device)
 
@@ -91,8 +96,9 @@ def main() -> None:
 
     logit_scale = nn.Parameter(torch.ones([], device=device) * math.log(1 / 0.07))
 
-    epochs = cfg.get("epochs", 10)
-    lr = cfg.get("lr", 1e-3)
+    train_cfg = cfg.get("train", {})
+    epochs = train_cfg.get("num_epochs", cfg.get("epochs", 20))
+    lr = cfg.get("optim", {}).get("lr", cfg.get("lr", 3e-4))
 
     trainable_params = list(image_encoder.parameters()) + list(image_proj.parameters()) + list(text_proj.parameters()) + [logit_scale]
     optimizer = optim.AdamW(trainable_params, lr=lr, weight_decay=cfg.get("weight_decay", 0.01))
@@ -115,8 +121,8 @@ def main() -> None:
 
             optimizer.zero_grad()
 
-            img_embeds = image_encoder(images)
-            img_embeds = image_proj(img_embeds[:, 0, :])
+            img_embeds = image_encoder(images)  # (B, d_model) CLS embedding
+            img_embeds = image_proj(img_embeds)
 
             with torch.no_grad():
                 txt_features = text_encoder(texts)
@@ -125,8 +131,7 @@ def main() -> None:
             img_embeds = torch.nn.functional.normalize(img_embeds, p=2, dim=-1)
             txt_embeds = torch.nn.functional.normalize(txt_embeds, p=2, dim=-1)
 
-            temperature = 1.0 / torch.exp(logit_scale)
-            loss = clip_loss(img_embeds, txt_embeds, temperature=temperature)
+            loss = clip_loss(img_embeds, txt_embeds, logit_scale)
 
             loss.backward()
             optimizer.step()
@@ -141,7 +146,6 @@ def main() -> None:
         scheduler.step()
 
         print(f"Evaluating Zero-shot Val Acc...", flush=True)
-        image_encoder.d_model = 384
         image_encoder.eval()
         image_proj.eval()
         class_prompts = [f"a satellite image of {c}" for c in EUROSAT_CLASSES]
